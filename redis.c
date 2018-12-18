@@ -27,6 +27,7 @@
 #include "ext/standard/info.h"
 #include "php_redis.h"
 #include <zend_exceptions.h>
+#include "php_network.h"
 
 zend_class_entry *redis_ce;
 zend_class_entry *redis_exception_ce;
@@ -38,9 +39,197 @@ ZEND_DECLARE_MODULE_GLOBALS(redis)
 /* True global resources - no need for thread safety here */
 static int le_redis;
 
+int redis_check_eof(RedisSock *redis_sock)
+{
+    if (php_stream_eof(redis_sock->stream) == 0) {
+        return 0;
+    }
+
+    return -1;
+}
+
+RedisSock *redis_sock_get(zval *id)
+{
+    redis_object *redis;
+
+    if (Z_TYPE_P(id) == IS_OBJECT) {
+        redis = PHPREDIS_GET_OBJECT(redis_object, id);
+
+        if (redis->sock) {
+            return redis->sock;
+        }
+    }
+
+    return NULL;
+}
+
+int redis_sock_write(RedisSock *redis_sock, char *cmd, size_t sz)
+{
+    if (redis_check_eof(redis_sock) == 0 && php_stream_write(redis_sock->stream, cmd, sz) == sz) {
+        return sz;
+    }
+
+    return -1;
+}
+
+char *redis_sock_read(RedisSock *redis_sock, int *buf_len)
+{
+    char buf[4096];
+    size_t len;
+
+    if (redis_check_eof(redis_sock) == -1) {
+        return NULL;
+    }
+
+    if (php_stream_get_line(redis_sock->stream, buf, sizeof(buf)-1, &len) == NULL) {
+        // redis_sock_disconnect(redis_sock, 1);
+        zend_throw_exception(redis_exception_ce, "read error on connection", 0);
+        return NULL;
+    }
+
+    switch(buf[0]) {
+    case '+':
+        if (len > 1) {
+            *buf_len = len;
+            return estrndup(buf, *buf_len);
+        }
+    }
+
+    return NULL;
+}
+
+void redis_sock_set_err(RedisSock *redis_sock, const char *msg, int msg_len)
+{
+    if (redis_sock->err != NULL) {
+        zend_string_release(redis_sock->err);
+        redis_sock->err = NULL;
+    }
+
+    if (msg != NULL && msg_len > 0) {
+        redis_sock->err = zend_string_init(msg, msg_len, 0);
+    }
+}
+
+RedisSock *redis_sock_create(char *host, int host_len, unsigned short port, double timeout)
+{
+    RedisSock *redis_sock;
+    redis_sock = ecalloc(1, sizeof(RedisSock));
+
+    redis_sock->stream = NULL;
+    redis_sock->host = zend_string_init(host, host_len, 0);
+    redis_sock->port = port;
+    redis_sock->timeout = timeout;
+    redis_sock->err = NULL;
+    redis_sock->status = REDIS_SOCK_STATUS_DISCONNECTED;
+
+    return redis_sock;
+}
+
+int redis_sock_connect(RedisSock *redis_sock)
+{
+    struct timeval tv, *tv_ptr = NULL;
+    char host[1024];
+    const char *fmtstr = "%s:%d";
+    int host_len, err = 0, usocket = 0;
+    int tcp_flag = 1;
+    php_netstream_data_t *sock;
+    zend_string *estr = NULL;
+
+    if (redis_sock->stream != NULL) {
+        //redis_sock_disconnect(redis_sock, 0);
+    }
+
+    tv.tv_sec = (time_t)redis_sock->timeout;
+    tv.tv_usec = (int)((redis_sock->timeout - tv.tv_sec) * 1000000);
+
+    if (tv.tv_sec != 0 || tv.tv_usec != 0) {
+        tv_ptr = &tv;
+    }
+
+    if (redis_sock->port == 0) redis_sock->port = 6379;
+
+    host_len = snprintf(host, sizeof(host), fmtstr, ZSTR_VAL(redis_sock->host), redis_sock->port);
+
+    redis_sock->stream = php_stream_xport_create(host, host_len, 0,
+                                                 STREAM_XPORT_CLIENT|STREAM_XPORT_CONNECT, "",
+                                                 tv_ptr, NULL, &estr, &err);
+
+    if (!redis_sock->stream) {
+        if (estr) {
+            redis_sock_set_err(redis_sock, ZSTR_VAL(estr), ZSTR_LEN(estr));
+            zend_string_release(estr);
+        }
+
+        return -1;
+    }
+
+    sock = (php_netstream_data_t *)redis_sock->stream->abstract;
+    if (!usocket) {
+        err = setsockopt(sock->socket, IPPROTO_TCP, TCP_NODELAY, (char*) &tcp_flag, sizeof(tcp_flag));
+        //PHPREDIS_NOTUSED(err);
+        //err = setsockopt(sock->socket, SOL_SOCKET, SO_KEEPALIVE, (char*) &redis_sock->tcp_keepalive, sizeof(redis_sock->tcp_keepalive));
+        //PHPREDIS_NOTUSED(err);
+    }
+
+    php_stream_auto_cleanup(redis_sock->stream);
+
+    php_stream_set_option(redis_sock->stream,
+                          PHP_STREAM_OPTION_WRITE_BUFFER, PHP_STREAM_BUFFER_NONE, NULL);
+
+    redis_sock->status = REDIS_SOCK_STATUS_CONNECTED;
+
+    return 0;
+}
+
+int redis_sock_server_open(RedisSock *redis_sock)
+{
+    int res = -1;
+
+    switch(redis_sock->status) {
+    case REDIS_SOCK_STATUS_DISCONNECTED:
+        return redis_sock_connect(redis_sock);
+    case REDIS_SOCK_STATUS_CONNECTED:
+        res = 0;
+        break;
+    }
+
+    return res;
+}
+
+zend_object_handlers redis_object_handlers;
+
+void free_redis_object(zend_object *object)
+{
+    redis_object *redis = (redis_object *)((char *)(object) - XtOffsetOf(redis_object, std));
+
+    zend_object_std_dtor(&redis->std);
+    if (redis->sock) {
+        //redis_sock_disconnect(redis->sock, 0 TSRMLS_CC);
+        //redis_free_socket(redis->sock);
+    }
+}
+
+zend_object *create_redis_object(zend_class_entry *ce)
+{
+    redis_object *redis = ecalloc(1, sizeof(redis_object) + zend_object_properties_size(ce));
+
+    redis->sock = NULL;
+
+    zend_object_std_init(&redis->std, ce);
+    object_properties_init(&redis->std, ce);
+
+    memcpy(&redis_object_handlers, zend_get_std_object_handlers(), sizeof(redis_object_handlers));
+    redis_object_handlers.offset = XtOffsetOf(redis_object, std);
+    redis_object_handlers.free_obj = free_redis_object;
+    redis->std.handlers = &redis_object_handlers;
+
+    return &redis->std;
+}
+
 static zend_function_entry redis_method_entry[] = {
     PHP_ME(Redis, __construct, NULL, ZEND_ACC_PUBLIC)
     PHP_ME(Redis, connect, NULL, ZEND_ACC_PUBLIC)
+    PHP_ME(Redis, ping, NULL, ZEND_ACC_PUBLIC)
     PHP_FE_END
 };
 
@@ -56,20 +245,73 @@ PHP_METHOD(Redis, connect)
     char *host = NULL;
     zend_long port = -1;
     double timeout = 0.0;
+    redis_object *redis;
 
+    if (zend_parse_parameters(ZEND_NUM_ARGS(), "s|ld", &host, &host_len, &port, &timeout) == FAILURE) {
+        RETURN_FALSE;
+    }
+    /*
     if (zend_parse_method_parameters(ZEND_NUM_ARGS(), getThis(),
                                      "Os|ld", &object, redis_ce, &host, &host_len,
                                      &port, &timeout) == FAILURE) {
         RETURN_FALSE;
     }
+    */
+
+    object = getThis();
 
     if (timeout < 0L || timeout > INT_MAX) {
         zend_throw_exception(redis_exception_ce,
-                             "Invalid connect timeout", 0 TSRMLS_CC);
+                             "Invalid connect timeout", 0);
         RETURN_FALSE;
     }
 
+    if (port == -1) {
+        port = 6379;
+    }
+
+    redis = PHPREDIS_GET_OBJECT(redis_object, object);
+
+
+    if (redis->sock) {
+        //redis_sock_disconnect(redis->sock, 0);
+        //redis_free_socket(redis->sock);
+    }
+
+    redis->sock = redis_sock_create(host, host_len, port, timeout);
+
+    if (redis_sock_server_open(redis->sock) < 0) {
+        if (redis->sock->err) {
+            zend_throw_exception(redis_exception_ce, ZSTR_VAL(redis->sock->err), 0);
+        }
+
+        //redis_free_socket(redis->socket);
+        redis->sock = NULL;
+        RETURN_FALSE;
+    }
+
+
     RETURN_TRUE;
+}
+
+PHP_METHOD(Redis, ping)
+{
+    RedisSock *redis_sock;
+    char *response;
+    int response_len;
+
+    redis_sock = redis_sock_get(getThis());
+
+    char cmd[] = "PING\r\n";
+    redis_sock_write(redis_sock, cmd, sizeof(cmd)-1);
+
+    if ((response = redis_sock_read(redis_sock, &response_len)) == NULL) {
+        RETURN_FALSE;
+    }
+
+    RETVAL_STRINGL(response, response_len);
+
+    efree(response);
 }
 
 /* {{{ PHP_INI
@@ -103,6 +345,7 @@ PHP_MINIT_FUNCTION(redis)
     zend_class_entry redis_class_entry;
     INIT_CLASS_ENTRY(redis_class_entry, "Redis", redis_method_entry);
     redis_ce = zend_register_internal_class(&redis_class_entry);
+    redis_ce->create_object = create_redis_object;
 
     exception_ce = zend_exception_get_default();
 

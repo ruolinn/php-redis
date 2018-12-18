@@ -21,10 +21,16 @@
 #ifndef PHP_REDIS_H
 #define PHP_REDIS_H
 
+
+#define REDIS_SOCK_STATUS_FAILED       0
+#define REDIS_SOCK_STATUS_DISCONNECTED 1
+#define REDIS_SOCK_STATUS_CONNECTED    2
+
 extern zend_module_entry redis_module_entry;
 
 PHP_METHOD(Redis, __construct);
 PHP_METHOD(Redis, connect);
+PHP_METHOD(Redis, ping);
 #define phpext_redis_ptr &redis_module_entry
 
 #define PHP_REDIS_VERSION "0.1.0" /* Replace with version number for your extension */
@@ -60,6 +66,22 @@ ZEND_END_MODULE_GLOBALS(redis)
 #if defined(ZTS) && defined(COMPILE_DL_REDIS)
 ZEND_TSRMLS_CACHE_EXTERN()
 #endif
+
+#define PHPREDIS_GET_OBJECT(class_entry, z) (class_entry *)((char *)Z_OBJ_P(z) - XtOffsetOf(class_entry, std))
+
+typedef struct {
+    php_stream *stream;
+    zend_string *host;
+    short port;
+    double timeout;
+    int status;
+    zend_string *err;
+} RedisSock;
+
+typedef struct {
+    RedisSock *sock;
+    zend_object std;
+} redis_object;
 
 #endif	/* PHP_REDIS_H */
 
