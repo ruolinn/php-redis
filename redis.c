@@ -110,6 +110,19 @@ void redis_sock_set_err(RedisSock *redis_sock, const char *msg, int msg_len)
     }
 }
 
+void redis_free_socket(RedisSock *redis_sock)
+{
+    if (redis_sock->err) {
+        zend_string_release(redis_sock->err);
+    }
+
+    if (redis_sock->host) {
+        zend_string_release(redis_sock->host);
+    }
+
+    efree(redis_sock);
+}
+
 RedisSock *redis_sock_create(char *host, int host_len, unsigned short port, double timeout)
 {
     RedisSock *redis_sock;
@@ -205,7 +218,7 @@ void free_redis_object(zend_object *object)
     zend_object_std_dtor(&redis->std);
     if (redis->sock) {
         //redis_sock_disconnect(redis->sock, 0 TSRMLS_CC);
-        //redis_free_socket(redis->sock);
+        redis_free_socket(redis->sock);
     }
 }
 
@@ -250,15 +263,6 @@ PHP_METHOD(Redis, connect)
     if (zend_parse_parameters(ZEND_NUM_ARGS(), "s|ld", &host, &host_len, &port, &timeout) == FAILURE) {
         RETURN_FALSE;
     }
-    /*
-    if (zend_parse_method_parameters(ZEND_NUM_ARGS(), getThis(),
-                                     "Os|ld", &object, redis_ce, &host, &host_len,
-                                     &port, &timeout) == FAILURE) {
-        RETURN_FALSE;
-    }
-    */
-
-    object = getThis();
 
     if (timeout < 0L || timeout > INT_MAX) {
         zend_throw_exception(redis_exception_ce,
@@ -270,8 +274,9 @@ PHP_METHOD(Redis, connect)
         port = 6379;
     }
 
-    redis = PHPREDIS_GET_OBJECT(redis_object, object);
-
+    object = getThis();
+    //redis = PHPREDIS_GET_OBJECT(redis_object, object);
+    redis = PHPREDIS_GET_OBJECT(redis_object, getThis());
 
     if (redis->sock) {
         //redis_sock_disconnect(redis->sock, 0);
@@ -285,8 +290,9 @@ PHP_METHOD(Redis, connect)
             zend_throw_exception(redis_exception_ce, ZSTR_VAL(redis->sock->err), 0);
         }
 
-        //redis_free_socket(redis->socket);
-        redis->sock = NULL;
+        //redis_free_socket(redis->sock);
+        //redis->sock = NULL;
+
         RETURN_FALSE;
     }
 
